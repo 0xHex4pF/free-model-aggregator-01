@@ -108,6 +108,16 @@ let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
+/** How many of the plan's first tries one provider may take: every provider's first call is safe, later calls risk its scheduled refusals, so the plan spreads first tries thin. */
+const PLAN_CAP = 2;
+
+interface PlannedPick {
+  providerId: string;
+  modelId: string;
+}
+
+/** The plan's first try per manifest row, by arrival index: computed once from the brief and the probes. */
+let plan = new Map<number, PlannedPick>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -119,6 +129,7 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  plan = planAssignments();
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -166,10 +177,13 @@ function noteRefusal(providerId: string, status: number): void {
  * Every free candidate meeting the requirements, best first: highest rating, then a provider whose
  * wire matches the client's (no translation), then provider and model id. Providers exhausted by a
  * 402 are left out; providers refused three times running go after the rest (they are likely out).
- * A JSON-mode request (the client sent response_format) never routes to an Anthropic-wire
- * provider: that wire cannot carry it, and the echo would come back without it.
+ * The plan's pick for this request, when it is still in the running, goes first among the
+ * non-demoted: the plan already spread first tries across providers, so leading with it keeps the
+ * trial's calls thin instead of piling them onto the best provider. A JSON-mode request (the client
+ * sent response_format) never routes to an Anthropic-wire provider: that wire cannot carry it, and
+ * the echo would come back without it.
  */
-function candidatesFor(requires: Requirement, clientWire: 'openai' | 'anthropic', jsonMode: boolean): Candidate[] {
+function candidatesFor(requires: Requirement, clientWire: 'openai' | 'anthropic', jsonMode: boolean, planned?: PlannedPick): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -183,15 +197,67 @@ function candidatesFor(requires: Requirement, clientWire: 'openai' | 'anthropic'
     }
   }
   const demoted = (c: Candidate): number => (stateOf(c.probe.provider.id).refusals >= 3 ? 1 : 0);
+  const plannedKey = (c: Candidate): number => (planned !== undefined && c.probe.provider.id === planned.providerId && c.model.id === planned.modelId ? 0 : 1);
   const wirePenalty = (c: Candidate): number => (c.probe.provider.wire === clientWire ? 0 : 1);
   out.sort((a, b) => {
     if (demoted(a) !== demoted(b)) return demoted(a) - demoted(b);
+    if (plannedKey(a) !== plannedKey(b)) return plannedKey(a) - plannedKey(b);
     if (a.rating !== b.rating) return b.rating - a.rating;
     if (wirePenalty(a) !== wirePenalty(b)) return wirePenalty(a) - wirePenalty(b);
     if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
     return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
   });
   return out;
+}
+
+/**
+ * Assign every manifest row a first try before any request arrives: the most constrained rows
+ * first (fewest feasible models), heaviest first among those, each taking the best-rated feasible
+ * model on a provider still under the plan cap, overflowing only when no under-cap model meets the
+ * row. Deterministic from the brief and the probes alone, so a replay plans identically; a row
+ * with no feasible model gets no pick and falls back to the live ordering.
+ */
+function planAssignments(): Map<number, PlannedPick> {
+  const manifest = brief.workload?.manifest ?? [];
+  const usage = new Map<string, number>();
+  const used = (providerId: string): number => usage.get(providerId) ?? 0;
+  const feasible = manifest.map((row) => {
+    const list: Candidate[] = [];
+    for (const probe of probes) {
+      if (!probe.ok) continue;
+      if (row.api === 'openai' && row.requires.json === true && probe.provider.wire === 'anthropic') continue;
+      for (const model of probe.models) {
+        const ratingRow = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+        if (!modelFree(model, ratingRow)) continue;
+        if (!meetsRequirements(row.requires, capabilitiesOf(model, ratingRow))) continue;
+        list.push({ probe, model, rating: ratingRow?.rating_milli ?? 0 });
+      }
+    }
+    const wirePenalty = (c: Candidate): number => (c.probe.provider.wire === row.api ? 0 : 1);
+    list.sort((a, b) => {
+      if (a.rating !== b.rating) return b.rating - a.rating;
+      if (wirePenalty(a) !== wirePenalty(b)) return wirePenalty(a) - wirePenalty(b);
+      if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
+      return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+    });
+    return list;
+  });
+  const order = manifest.map((_row, index) => index).sort((a, b) => {
+    if (feasible[a].length !== feasible[b].length) return feasible[a].length - feasible[b].length;
+    if (manifest[a].weight !== manifest[b].weight) return manifest[b].weight - manifest[a].weight;
+    return a - b;
+  });
+  const picks = new Map<number, PlannedPick>();
+  for (const index of order) {
+    const list = feasible[index];
+    if (list.length === 0) continue;
+    const pick = list.find((c) => used(c.probe.provider.id) < PLAN_CAP)
+      ?? list.find((c) => used(c.probe.provider.id) < PLAN_CAP + 1)
+      ?? [...list].sort((a, b) => used(a.probe.provider.id) - used(b.probe.provider.id))[0];
+    picks.set(index, { providerId: pick.probe.provider.id, modelId: pick.model.id });
+    usage.set(pick.probe.provider.id, used(pick.probe.provider.id) + 1);
+  }
+  return picks;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -331,7 +397,8 @@ async function serve(
   anthropicVersion: string | undefined,
 ): Promise<void> {
   const stream = body.stream === true;
-  const candidates = candidatesFor(requirementsFor(body), clientWire, jsonModeOf(clientWire, body));
+  const requestIndex = manifestIndex;
+  const candidates = candidatesFor(requirementsFor(body), clientWire, jsonModeOf(clientWire, body), plan.get(requestIndex));
   if (candidates.length === 0) {
     if (clientWire === 'openai') return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
