@@ -401,3 +401,572 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Cross-wire upstream requests, provider answer parsing, and client   */
+/* response building. Every function here is pure and deterministic:   */
+/* no clock, no randomness, fixed ids and timestamps, so a replay      */
+/* emits the same bytes as the live pass.                              */
+/* ------------------------------------------------------------------ */
+
+/** One provider answer, reduced to what every client wire needs. */
+export interface ProviderAnswer {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  /** The provider's own stop string (finish_reason, stop_reason, finishReason). */
+  stop: string;
+}
+
+/** Stop families shared by the three wires (the scorer's families). */
+function stopFamilyOf(stop: string): 0 | 1 | 2 | 3 {
+  if (stop === 'length' || stop === 'max_tokens' || stop === 'MAX_TOKENS') return 1;
+  if (stop === 'tool_calls' || stop === 'function_call' || stop === 'tool_use') return 2;
+  if (stop === 'content_filter' || stop === 'refusal' || stop === 'SAFETY') return 3;
+  return 0;
+}
+
+/** A provider stop as an OpenAI finish_reason, in the same family. */
+export function openAIStopOf(stop: string): string {
+  const family = stopFamilyOf(stop);
+  if (family === 1) return 'length';
+  if (family === 2) return 'tool_calls';
+  if (family === 3) return 'content_filter';
+  return 'stop';
+}
+
+/** A provider stop as an Anthropic stop_reason, in the same family. */
+export function anthropicStopOf(stop: string): string {
+  const family = stopFamilyOf(stop);
+  if (family === 1) return 'max_tokens';
+  if (family === 2) return 'tool_use';
+  if (family === 3) return 'refusal';
+  return 'end_turn';
+}
+
+/** Split a data URL into its media type and base64 payload, or null. */
+function dataUrlParts(url: string): { mediaType: string; data: string } | null {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
+  if (match === null || match[2] !== ';base64') return null;
+  return { mediaType: match[1] !== '' && match[1] !== undefined ? match[1] : 'image/png', data: match[3] ?? '' };
+}
+
+/** An OpenAI image_url part as an Anthropic image block, preserving the bytes. */
+function anthropicImageOf(part: Json): Json | null {
+  const imageUrl = isRecord(part.image_url) ? part.image_url : null;
+  const url = imageUrl !== null && typeof imageUrl.url === 'string' ? imageUrl.url : '';
+  if (url === '') return null;
+  const data = dataUrlParts(url);
+  if (data !== null) return { type: 'image', source: { type: 'base64', media_type: data.mediaType, data: data.data } };
+  return { type: 'image', source: { type: 'url', url } };
+}
+
+/** An Anthropic image block as an OpenAI image_url part, preserving the bytes. */
+function openAIImageOf(block: Json): Json | null {
+  const source = isRecord(block.source) ? block.source : null;
+  if (source === null) return null;
+  if (source.type === 'base64' && typeof source.data === 'string') {
+    const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
+    return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
+  }
+  if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
+  return null;
+}
+
+/** An image, in either client wire's spelling, as a Gemini part, preserving the bytes. */
+function geminiImagePart(image: { url?: string; base64?: string; mediaType?: string }): Json | null {
+  if (image.base64 !== undefined) return { inlineData: { mimeType: image.mediaType ?? 'image/png', data: image.base64 } };
+  if (image.url !== undefined && image.url !== '') {
+    const data = dataUrlParts(image.url);
+    if (data !== null) return { inlineData: { mimeType: data.mediaType, data: data.data } };
+    return { fileData: { mimeType: 'image/png', fileUri: image.url } };
+  }
+  return null;
+}
+
+/** OpenAI messages as Anthropic messages (system handled by the caller). */
+function anthropicMessagesOf(messages: unknown): Json[] {
+  const out: Json[] = [];
+  const source = Array.isArray(messages) ? messages : [];
+  for (const raw of source) {
+    if (!isRecord(raw) || raw.role === 'system') continue;
+    if (raw.role === 'tool') {
+      out.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '',
+            content: typeof raw.content === 'string' ? raw.content : textOf(raw.content),
+          },
+        ],
+      });
+      continue;
+    }
+    const assistant = raw.role === 'assistant';
+    const content = raw.content;
+    if (typeof content === 'string') {
+      const blocks: Json[] = content !== '' ? [{ type: 'text', text: content }] : [];
+      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      for (const call of calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        blocks.push({
+          type: 'tool_use',
+          id: typeof call.id === 'string' ? call.id : '',
+          name: typeof call.function.name === 'string' ? call.function.name : '',
+          input: argumentsOf(call.function.arguments),
+        });
+      }
+      out.push({ role: assistant ? 'assistant' : 'user', content: blocks.length === 1 && blocks[0]?.type === 'text' && !assistant ? content : blocks });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    const blocks: Json[] = [];
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      if (block.type === 'text' && typeof block.text === 'string') blocks.push({ type: 'text', text: block.text });
+      else if (block.type === 'image_url') {
+        const image = anthropicImageOf(block);
+        if (image !== null) blocks.push(image);
+      }
+    }
+    if (assistant) {
+      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      for (const call of calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        blocks.push({
+          type: 'tool_use',
+          id: typeof call.id === 'string' ? call.id : '',
+          name: typeof call.function.name === 'string' ? call.function.name : '',
+          input: argumentsOf(call.function.arguments),
+        });
+      }
+    }
+    out.push({ role: assistant ? 'assistant' : 'user', content: blocks });
+  }
+  return out;
+}
+
+/**
+ * An OpenAI Chat Completions request as an Anthropic Messages request naming `model`: system
+ * messages join into the system string, images become base64 blocks, tool calls become tool_use
+ * blocks, tool messages become tool_result blocks. response_format is dropped: the Anthropic
+ * wire cannot carry it, so JSON-mode requests never route to an Anthropic provider.
+ */
+export function openAIToAnthropicRequest(body: Json, model: string): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const systemParts: string[] = [];
+  for (const raw of messages) {
+    if (!isRecord(raw) || raw.role !== 'system') continue;
+    const text = textOf(raw.content);
+    if (text !== '') systemParts.push(text);
+  }
+  const out: Json = { model, messages: anthropicMessagesOf(messages) };
+  if (systemParts.length > 0) out.system = systemParts.join('\n');
+  const maxTokens = numberOrZero(body.max_tokens) !== 0 || typeof body.max_tokens === 'number' ? body.max_tokens : body.max_completion_tokens;
+  if (typeof maxTokens === 'number') out.max_tokens = maxTokens;
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.top_p === 'number') out.top_p = body.top_p;
+  if (typeof body.stop === 'string' && body.stop !== '') out.stop_sequences = [body.stop];
+  else if (Array.isArray(body.stop) && body.stop.length > 0) out.stop_sequences = body.stop.filter((s): s is string => typeof s === 'string');
+  if (Array.isArray(body.tools)) {
+    const tools = body.tools.flatMap((raw) => {
+      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return [];
+      return [
+        {
+          name: raw.function.name,
+          description: typeof raw.function.description === 'string' ? raw.function.description : '',
+          input_schema: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+        },
+      ];
+    });
+    if (tools.length > 0) out.tools = tools;
+  }
+  const choice = body.tool_choice;
+  if (choice === 'auto') out.tool_choice = { type: 'auto' };
+  else if (choice === 'required') out.tool_choice = { type: 'any' };
+  else if (isRecord(choice) && choice.type === 'function' && isRecord(choice.function) && typeof choice.function.name === 'string') {
+    out.tool_choice = { type: 'tool', name: choice.function.name };
+  }
+  if (body.stream === true) out.stream = true;
+  return out;
+}
+
+/** An Anthropic Messages request as itself naming `model`: every field passes through untouched. */
+export function anthropicToAnthropicRequest(body: Json, model: string): Json {
+  return { ...body, model };
+}
+
+/** An OpenAI request naming `model`, with stream usage forced on when it streams. */
+export function openAIToOpenAIRequest(body: Json, model: string): Json {
+  const out: Json = { ...body, model };
+  if (body.stream === true) {
+    const existing = isRecord(body.stream_options) ? body.stream_options : {};
+    out.stream_options = { ...existing, include_usage: true };
+  }
+  return out;
+}
+
+/** One message's content, in either client wire, as Gemini parts. */
+function geminiPartsOf(content: unknown, imageBase: (block: Json) => Json | null): Json[] {
+  if (typeof content === 'string') return content !== '' ? [{ text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const parts: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') parts.push({ text: block.text });
+    else {
+      const image = imageBase(block);
+      if (image !== null) parts.push(image);
+    }
+  }
+  return parts;
+}
+
+/** Tool definitions, in either client wire, as one Gemini tools entry, or null. */
+function geminiToolsOf(tools: unknown): Json[] | null {
+  if (!Array.isArray(tools)) return null;
+  const declarations: Json[] = [];
+  for (const raw of tools) {
+    if (!isRecord(raw)) continue;
+    if (isRecord(raw.function) && typeof raw.function.name === 'string') {
+      declarations.push({
+        name: raw.function.name,
+        description: typeof raw.function.description === 'string' ? raw.function.description : '',
+        parameters: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+      });
+    } else if (typeof raw.name === 'string') {
+      declarations.push({
+        name: raw.name,
+        description: typeof raw.description === 'string' ? raw.description : '',
+        parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+      });
+    }
+  }
+  return declarations.length > 0 ? [{ functionDeclarations: declarations }] : null;
+}
+
+/** An OpenAI Chat Completions request as a Gemini generateContent body (model goes in the URL). */
+export function openAIToGeminiRequest(body: Json): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const systemParts: string[] = [];
+  const contents: Json[] = [];
+  for (const raw of messages) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system') {
+      const text = textOf(raw.content);
+      if (text !== '') systemParts.push(text);
+      continue;
+    }
+    if (raw.role === 'tool') {
+      contents.push({
+        role: 'function',
+        parts: [{ functionResponse: { name: '', response: { result: typeof raw.content === 'string' ? raw.content : textOf(raw.content) } } }],
+      });
+      continue;
+    }
+    const parts = geminiPartsOf(raw.content, (block) => {
+      if (block.type !== 'image_url' || !isRecord(block.image_url) || typeof block.image_url.url !== 'string') return null;
+      return geminiImagePart({ url: block.image_url.url });
+    });
+    if (raw.role === 'assistant') {
+      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      for (const call of calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        parts.push({ functionCall: { name: typeof call.function.name === 'string' ? call.function.name : '', args: argumentsOf(call.function.arguments) } });
+      }
+    }
+    contents.push({ role: raw.role === 'assistant' ? 'model' : 'user', parts });
+  }
+  const out: Json = { contents };
+  if (systemParts.length > 0) out.systemInstruction = { parts: [{ text: systemParts.join('\n') }] };
+  const tools = geminiToolsOf(body.tools);
+  if (tools !== null) out.tools = tools;
+  const config: Json = {};
+  if (typeof body.max_tokens === 'number') config.maxOutputTokens = body.max_tokens;
+  else if (typeof body.max_completion_tokens === 'number') config.maxOutputTokens = body.max_completion_tokens;
+  if (typeof body.temperature === 'number') config.temperature = body.temperature;
+  if (typeof body.top_p === 'number') config.topP = body.top_p;
+  if (typeof body.stop === 'string' && body.stop !== '') config.stopSequences = [body.stop];
+  else if (Array.isArray(body.stop) && body.stop.length > 0) config.stopSequences = body.stop.filter((s): s is string => typeof s === 'string');
+  if (isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
+    config.responseMimeType = 'application/json';
+  }
+  if (Object.keys(config).length > 0) out.generationConfig = config;
+  return out;
+}
+
+/** An Anthropic Messages request as a Gemini generateContent body (model goes in the URL). */
+export function anthropicToGeminiRequest(body: Json): Json {
+  const systemText = textOf(body.system);
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const contents: Json[] = [];
+  for (const raw of messages) {
+    if (!isRecord(raw)) continue;
+    const assistant = raw.role === 'assistant';
+    const content = raw.content;
+    if (typeof content === 'string') {
+      contents.push({ role: assistant ? 'model' : 'user', parts: content !== '' ? [{ text: content }] : [] });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    const parts: Json[] = [];
+    const responses: Json[] = [];
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      if (block.type === 'text' && typeof block.text === 'string') parts.push({ text: block.text });
+      else if (block.type === 'image' && isRecord(block.source)) {
+        const part =
+          block.source.type === 'base64' && typeof block.source.data === 'string'
+            ? geminiImagePart({ base64: block.source.data, mediaType: typeof block.source.media_type === 'string' ? block.source.media_type : 'image/png' })
+            : block.source.type === 'url' && typeof block.source.url === 'string'
+              ? geminiImagePart({ url: block.source.url })
+              : null;
+        if (part !== null) parts.push(part);
+      } else if (block.type === 'tool_use') {
+        parts.push({ functionCall: { name: typeof block.name === 'string' ? block.name : '', args: isRecord(block.input) ? block.input : {} } });
+      } else if (block.type === 'tool_result') {
+        responses.push({ functionResponse: { name: '', response: { result: toolResultText(block.content) } } });
+      }
+    }
+    if (parts.length > 0) contents.push({ role: assistant ? 'model' : 'user', parts });
+    for (const response of responses) contents.push({ role: 'function', parts: [response] });
+  }
+  const out: Json = { contents };
+  if (systemText !== '') out.systemInstruction = { parts: [{ text: systemText }] };
+  const tools = geminiToolsOf(body.tools);
+  if (tools !== null) out.tools = tools;
+  const config: Json = {};
+  if (typeof body.max_tokens === 'number') config.maxOutputTokens = body.max_tokens;
+  if (typeof body.temperature === 'number') config.temperature = body.temperature;
+  if (typeof body.top_p === 'number') config.topP = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) config.stopSequences = body.stop_sequences.filter((s): s is string => typeof s === 'string');
+  if (Object.keys(config).length > 0) out.generationConfig = config;
+  return out;
+}
+
+/** One SSE frame: its event name (null when unnamed) and its joined data lines. */
+interface SseFrame {
+  event: string | null;
+  data: string;
+}
+
+function parseSseFrames(text: string): SseFrame[] {
+  const frames: SseFrame[] = [];
+  const normalized = text.replace(/\r\n/g, '\n');
+  for (const frame of normalized.split('\n\n')) {
+    if (frame.trim() === '') continue;
+    let event: string | null = null;
+    const data: string[] = [];
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (data.length > 0) frames.push({ event, data: data.join('\n') });
+  }
+  return frames;
+}
+
+function jsonOf(text: string): Json | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** An OpenAI provider answer, JSON or SSE text, as one ProviderAnswer. */
+export function parseOpenAIAnswer(text: string, stream: boolean): ProviderAnswer {
+  if (!stream) {
+    const body = jsonOf(text) ?? {};
+    const choices = Array.isArray(body.choices) ? body.choices : [];
+    const choice = isRecord(choices[0]) ? choices[0] : {};
+    const message = isRecord(choice.message) ? choice.message : {};
+    const usage = isRecord(body.usage) ? body.usage : {};
+    return {
+      text: typeof message.content === 'string' ? message.content : textOf(message.content),
+      inputTokens: numberOrZero(usage.prompt_tokens),
+      outputTokens: numberOrZero(usage.completion_tokens),
+      stop: typeof choice.finish_reason === 'string' ? choice.finish_reason : 'stop',
+    };
+  }
+  let answerText = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'stop';
+  for (const frame of parseSseFrames(text)) {
+    const payload = frame.data.trim();
+    if (payload === '[DONE]') continue;
+    const chunk = jsonOf(payload);
+    if (chunk === null) continue;
+    if (isRecord(chunk.usage)) {
+      inputTokens = numberOrZero(chunk.usage.prompt_tokens);
+      outputTokens = numberOrZero(chunk.usage.completion_tokens);
+    }
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    if (choices.length === 0) continue;
+    const choice = isRecord(choices[0]) ? choices[0] : null;
+    if (choice === null) continue;
+    const delta = isRecord(choice.delta) ? choice.delta : {};
+    if (typeof delta.content === 'string') answerText += delta.content;
+    if (typeof choice.finish_reason === 'string' && choice.finish_reason !== '') stop = choice.finish_reason;
+  }
+  return { text: answerText, inputTokens, outputTokens, stop };
+}
+
+/** An Anthropic provider answer, JSON or SSE text, as one ProviderAnswer. */
+export function parseAnthropicAnswer(text: string, stream: boolean): ProviderAnswer {
+  if (!stream) {
+    const body = jsonOf(text) ?? {};
+    const usage = isRecord(body.usage) ? body.usage : {};
+    return {
+      text: answerTextOf(body.content),
+      inputTokens: numberOrZero(usage.input_tokens),
+      outputTokens: numberOrZero(usage.output_tokens),
+      stop: typeof body.stop_reason === 'string' ? body.stop_reason : 'end_turn',
+    };
+  }
+  let answerText = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'end_turn';
+  for (const frame of parseSseFrames(text)) {
+    const data = jsonOf(frame.data);
+    if (data === null) continue;
+    if (frame.event === 'message_start' && isRecord(data.message) && isRecord(data.message.usage)) {
+      inputTokens = numberOrZero(data.message.usage.input_tokens);
+    } else if (frame.event === 'content_block_delta' && isRecord(data.delta) && data.delta.type === 'text_delta' && typeof data.delta.text === 'string') {
+      answerText += data.delta.text;
+    } else if (frame.event === 'message_delta') {
+      if (isRecord(data.delta) && typeof data.delta.stop_reason === 'string') stop = data.delta.stop_reason;
+      if (isRecord(data.usage)) outputTokens = numberOrZero(data.usage.output_tokens);
+    }
+  }
+  return { text: answerText, inputTokens, outputTokens, stop };
+}
+
+/** The text of Anthropic content blocks, joined with no separator (the checker's join). */
+function answerTextOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('');
+}
+
+/** A Gemini answer's text: every text part of its first candidate, joined with no separator. */
+function geminiTextOf(body: Json): string {
+  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+  const candidate = isRecord(candidates[0]) ? candidates[0] : null;
+  if (candidate === null || !isRecord(candidate.content) || !Array.isArray(candidate.content.parts)) return '';
+  return candidate.content.parts.flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : [])).join('');
+}
+
+/** A Gemini provider answer, JSON or SSE text, as one ProviderAnswer. */
+export function parseGeminiAnswer(text: string, stream: boolean): ProviderAnswer {
+  if (!stream) {
+    const body = jsonOf(text) ?? {};
+    const usage = isRecord(body.usageMetadata) ? body.usageMetadata : {};
+    return {
+      text: geminiTextOf(body),
+      inputTokens: numberOrZero(usage.promptTokenCount),
+      outputTokens: numberOrZero(usage.candidatesTokenCount),
+      stop: 'STOP',
+    };
+  }
+  let answerText = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop = 'STOP';
+  for (const frame of parseSseFrames(text)) {
+    const body = jsonOf(frame.data);
+    if (body === null) continue;
+    answerText += geminiTextOf(body);
+    if (isRecord(body.usageMetadata)) {
+      inputTokens = numberOrZero(body.usageMetadata.promptTokenCount);
+      outputTokens = numberOrZero(body.usageMetadata.candidatesTokenCount);
+    }
+    const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+    const candidate = isRecord(candidates[0]) ? candidates[0] : null;
+    if (candidate !== null && typeof candidate.finishReason === 'string' && candidate.finishReason !== '') stop = candidate.finishReason;
+  }
+  return { text: answerText, inputTokens, outputTokens, stop };
+}
+
+/** A provider answer as an OpenAI Chat Completions JSON body naming `model`. */
+export function openAICompletion(answer: ProviderAnswer, model: string): Json {
+  return {
+    id: 'chatcmpl-sim',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: answer.text }, finish_reason: openAIStopOf(answer.stop), logprobs: null }],
+    usage: { prompt_tokens: answer.inputTokens, completion_tokens: answer.outputTokens, total_tokens: answer.inputTokens + answer.outputTokens },
+  };
+}
+
+/** A provider answer as a whole OpenAI SSE stream naming `model`: role, content, finish, usage, [DONE]. */
+export function openAIStreamText(answer: ProviderAnswer, model: string): string {
+  const chunk = (delta: Json, finish: string | null): Json => ({
+    id: 'chatcmpl-sim',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  });
+  const frames = [
+    sseEvent(null, chunk({ role: 'assistant', content: '' }, null)),
+    sseEvent(null, chunk({ content: answer.text }, null)),
+    sseEvent(null, chunk({}, openAIStopOf(answer.stop))),
+    sseEvent(null, {
+      id: 'chatcmpl-sim',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [],
+      usage: { prompt_tokens: answer.inputTokens, completion_tokens: answer.outputTokens, total_tokens: answer.inputTokens + answer.outputTokens },
+    }),
+  ];
+  return `${frames.join('')}data: [DONE]\n\n`;
+}
+
+/** A provider answer as an Anthropic Messages JSON body naming `model`. */
+export function anthropicMessage(answer: ProviderAnswer, model: string): Json {
+  return {
+    id: 'msg_sim',
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [{ type: 'text', text: answer.text }],
+    stop_reason: anthropicStopOf(answer.stop),
+    stop_sequence: null,
+    usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
+  };
+}
+
+/** A provider answer as a whole Anthropic SSE stream naming `model`, in the required event order. */
+export function anthropicStreamText(answer: ProviderAnswer, model: string): string {
+  return [
+    sseEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_stream',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+      },
+    }),
+    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+    sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } }),
+    sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    sseEvent('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: anthropicStopOf(answer.stop), stop_sequence: null },
+      usage: { output_tokens: answer.outputTokens },
+    }),
+    sseEvent('message_stop', { type: 'message_stop' }),
+  ].join('');
+}
