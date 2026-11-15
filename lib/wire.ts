@@ -461,18 +461,6 @@ function anthropicImageOf(part: Json): Json | null {
   return { type: 'image', source: { type: 'url', url } };
 }
 
-/** An Anthropic image block as an OpenAI image_url part, preserving the bytes. */
-function openAIImageOf(block: Json): Json | null {
-  const source = isRecord(block.source) ? block.source : null;
-  if (source === null) return null;
-  if (source.type === 'base64' && typeof source.data === 'string') {
-    const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
-    return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
-  }
-  if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
-  return null;
-}
-
 /** An image, in either client wire's spelling, as a Gemini part, preserving the bytes. */
 function geminiImagePart(image: { url?: string; base64?: string; mediaType?: string }): Json | null {
   if (image.base64 !== undefined) return { inlineData: { mimeType: image.mediaType ?? 'image/png', data: image.base64 } };
@@ -563,7 +551,7 @@ export function openAIToAnthropicRequest(body: Json, model: string): Json {
   }
   const out: Json = { model, messages: anthropicMessagesOf(messages) };
   if (systemParts.length > 0) out.system = systemParts.join('\n');
-  const maxTokens = numberOrZero(body.max_tokens) !== 0 || typeof body.max_tokens === 'number' ? body.max_tokens : body.max_completion_tokens;
+  const maxTokens = typeof body.max_tokens === 'number' ? body.max_tokens : body.max_completion_tokens;
   if (typeof maxTokens === 'number') out.max_tokens = maxTokens;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
